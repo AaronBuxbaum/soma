@@ -1,89 +1,84 @@
 #!/usr/bin/env python3
 """
-Fluorescent Soma Counting Algorithm
+Fluorescent Soma Counting with Cellpose on a Directory of Images
 
-This script processes fluorescent microscopy images to detect, count, and classify cell soma into:
+This script processes all fluorescent microscopy images in a specified directory to detect, count,
+and classify cell soma into:
     - EGFP (green)
     - tdTomato (red)
     - Coexpressed (yellow/orange)
 
-Outputs:
-    - A CSV file with soma details (ID, X_pixel, Y_pixel, X_micron, Y_micron, Type, Hex)
-    - An overlay image with annotated detections
+It uses Cellpose (a deep learning segmentation tool) to generate accurate cell masks.
+For each detected cell, the script extracts its centroid and determines the cell type based on the
+original green and red channels. For each processed image, the script outputs a CSV file (with cell
+details: ID, pixel and micron coordinates, cell type, and hex color at the centroid) and an annotated
+overlay image.
 
-Default parameter values have been tuned using the provided example image.
-Usage example:
-    python soma_counter.py path/to/image.png --save_csv --save_overlay --output_folder my_output
+Additional CLI arguments let you adjust the conversion factor (pixels per micron) and configure
+Cellpose settings such as the model type, GPU usage, estimated cell diameter, flow threshold, cell
+probability threshold, and channels.
+
+Usage Example:
+    python soma_counter_cellpose_dir.py input --cellpose_flow_threshold 0.4 \
+         --cellpose_cellprob_threshold 0.0 --cellpose_channels 0,0
 """
 
+import os
 import cv2
 import numpy as np
 import pandas as pd
 import argparse
-from skimage.feature import peak_local_max  # from scikit-image
-from skimage.segmentation import watershed
+from cellpose import models  # Requires cellpose package
 from scipy import ndimage
 
-# Conversion factor: 1 micron = 1.6091 pixels, so pixels -> microns is 1/1.6091
-PIXEL_TO_MICRON = 1 / 1.6091
-
-def preprocess_channel(channel, median_ksize=3, gaussian_sigma=1.0):
-    """Apply median filtering and Gaussian blur to reduce noise."""
-    filtered = cv2.medianBlur(channel, median_ksize)
-    filtered = cv2.GaussianBlur(filtered, (0, 0), gaussian_sigma)
-    return filtered
-
-def threshold_channel(channel, thresh_val=60):
-    """Threshold a channel to create a binary image."""
-    _, binary = cv2.threshold(channel, thresh_val, 255, cv2.THRESH_BINARY)
-    return binary
-
-def split_cells(binary_mask, min_distance=10):
+def run_cellpose_segmentation(composite, cellpose_model, diameter=None, channels=[0,0],
+                              flow_threshold=0.4, cellprob_threshold=0.0):
     """
-    Use watershed segmentation to separate merged cells.
+    Use Cellpose to segment cells from the composite image.
+    
     Parameters:
-        binary_mask: Binary image from thresholding.
-        min_distance: Minimum distance between local maxima.
+        composite: A single-channel (grayscale) image (numpy array).
+        cellpose_model: A preloaded Cellpose model.
+        diameter: Estimated cell diameter. If None, Cellpose will estimate it.
+        channels: List specifying which channels to use (e.g. [0,0]).
+        flow_threshold: Flow threshold for Cellpose segmentation.
+        cellprob_threshold: Cell probability threshold for Cellpose segmentation.
+        
     Returns:
-        A labeled mask where each separated cell has a unique label.
+        masks: A labeled mask (numpy array) with unique labels for each cell.
     """
-    # Compute the distance transform of the binary image.
-    distance = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
-    # Identify local peaks in the distance map.
-    # Remove the deprecated "indices" parameter.
-    local_max_coords = peak_local_max(distance, min_distance=min_distance, labels=binary_mask)
-    # Convert coordinates to a boolean mask.
-    local_max = np.zeros(distance.shape, dtype=bool)
-    if local_max_coords.size:
-        local_max[tuple(local_max_coords.T)] = True
-    markers, _ = ndimage.label(local_max)
-    labels = watershed(-distance, markers, mask=binary_mask)
-    return labels
-
-def detect_soma_centroids(binary_mask, min_area=40):
-    """
-    Detect connected components in a binary mask and return centroids for regions
-    that meet the minimum area criteria.
-    Returns:
-        A list of tuples (label, centroid) and the labeled mask.
-    """
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        binary_mask, connectivity=8
+    # Normalize image to float values in range [0,1]
+    composite_norm = composite.astype(np.float32) / 255.0
+    # Run Cellpose segmentation with configurable channels
+    masks, flows, styles, diams = cellpose_model.eval(
+        composite_norm, 
+        channels=channels,
+        diameter=diameter, 
+        flow_threshold=flow_threshold, 
+        cellprob_threshold=cellprob_threshold
     )
-    soma_list = []
-    for label in range(1, num_labels):  # Skip label 0 (background)
-        area = stats[label, cv2.CC_STAT_AREA]
-        if area >= min_area:
-            soma_list.append((label, centroids[label]))
-    return soma_list, labels
+    return masks
 
-def classify_cell(centroid, green_mask, red_mask):
+def classify_cell(centroid, g_channel, r_channel, intensity_thresh=60):
     """
-    Classify the cell at the given centroid based on its presence in the green and red masks.
+    Classify a cell based on the intensities at its centroid.
+    
+    Parameters:
+        centroid: (x, y) coordinates of the cell centroid.
+        g_channel: Original green channel image.
+        r_channel: Original red channel image.
+        intensity_thresh: Intensity threshold to consider signal present.
+        
+    Returns:
+        A string indicating the cell type ("EGFP", "tdTomato", "coexpressed", or "unknown").
     """
     x, y = int(round(centroid[0])), int(round(centroid[1]))
-    green_present = green_mask[y, x] > 0
-    red_present = red_mask[y, x] > 0
+    if y >= g_channel.shape[0] or x >= g_channel.shape[1]:
+        return "unknown"
+    green_val = g_channel[y, x]
+    red_val = r_channel[y, x]
+    green_present = green_val >= intensity_thresh
+    red_present = red_val >= intensity_thresh
 
     if green_present and red_present:
         return "coexpressed"
@@ -96,60 +91,70 @@ def classify_cell(centroid, green_mask, red_mask):
 
 def hex_color_at(image, centroid):
     """
-    Return the hex code of the pixel at the given centroid in the original image.
+    Return the hex color code at the given centroid in the original image.
     Note: OpenCV loads images in BGR order.
     """
     x, y = int(round(centroid[0])), int(round(centroid[1]))
     b, g, r = image[y, x]
     return '#{:02X}{:02X}{:02X}'.format(r, g, b)
 
-def process_image(image_path, green_thresh=60, red_thresh=60, median_ksize=3,
-                  gaussian_sigma=1.0, min_area=40, min_distance=10):
+def process_image(image_path, intensity_thresh=60, diameter=None, conversion_factor=1/1.6091,
+                  cellpose_model=None, channels=[0,0], flow_threshold=0.4, cellprob_threshold=0.0):
     """
-    Process the given image to detect, count, and classify soma.
+    Process the given image to detect, count, and classify soma using Cellpose.
+    
+    Parameters:
+        image_path: Path to the input image.
+        intensity_thresh: Intensity threshold for fluorescence classification.
+        diameter: Estimated cell diameter for Cellpose segmentation (optional).
+        conversion_factor: Factor to convert pixel coordinates to microns.
+        cellpose_model: Pre-instantiated Cellpose model.
+        channels: List specifying which channels to use for Cellpose.
+        flow_threshold: Flow threshold for Cellpose segmentation.
+        cellprob_threshold: Cell probability threshold for Cellpose segmentation.
+        
     Returns:
-        - results: List of dictionaries with soma details.
-        - overlay: Annotated overlay image.
+        results: List of dictionaries with soma details.
+        overlay: Annotated overlay image.
     """
-    # Read the image
     image = cv2.imread(image_path)
     if image is None:
         raise ValueError(f"Error: Could not load image at {image_path}")
     
-    # Create an overlay image (convert to RGB for annotation)
+    # Create overlay image (convert to RGB for annotation)
     overlay = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     
     # Split channels (OpenCV uses BGR order)
     b_channel, g_channel, r_channel = cv2.split(image)
     
-    # Preprocess channels
-    g_proc = preprocess_channel(g_channel, median_ksize, gaussian_sigma)
-    r_proc = preprocess_channel(r_channel, median_ksize, gaussian_sigma)
+    # Create composite grayscale image by averaging green and red channels
+    composite = cv2.addWeighted(g_channel, 0.5, r_channel, 0.5, 0)
     
-    # Threshold channels
-    g_binary = threshold_channel(g_proc, green_thresh)
-    r_binary = threshold_channel(r_proc, red_thresh)
+    # Run Cellpose segmentation
+    masks = run_cellpose_segmentation(
+        composite, 
+        cellpose_model, 
+        diameter=diameter, 
+        channels=channels,
+        flow_threshold=flow_threshold, 
+        cellprob_threshold=cellprob_threshold
+    )
     
-    # Apply watershed segmentation to split merged cells
-    g_labels = split_cells(g_binary, min_distance)
-    r_labels = split_cells(r_binary, min_distance)
-    
-    # Convert watershed labels to binary masks (non-zero pixels are cells)
-    g_watershed = (g_labels > 0).astype(np.uint8) * 255
-    r_watershed = (r_labels > 0).astype(np.uint8) * 255
-    
-    # Create a combined mask (logical OR of green and red detections)
-    combined_mask = cv2.bitwise_or(g_watershed, r_watershed)
-    
-    # Detect soma centroids in the combined mask
-    soma_centroids, _ = detect_soma_centroids(combined_mask, min_area)
+    # Extract centroids using connected components on the Cellpose masks
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        masks.astype(np.uint8), connectivity=8
+    )
     
     results = []
-    for label, centroid in soma_centroids:
-        cell_type = classify_cell(centroid, g_watershed, r_watershed)
+    for label in range(1, num_labels):  # Skip background label 0
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < 40:  # Skip very small regions
+            continue
+        centroid = centroids[label]
+        cell_type = classify_cell(centroid, g_channel, r_channel, intensity_thresh)
         hex_val = hex_color_at(image, centroid)
-        x_micron = centroid[0] * PIXEL_TO_MICRON
-        y_micron = centroid[1] * PIXEL_TO_MICRON
+        x_micron = centroid[0] * conversion_factor
+        y_micron = centroid[1] * conversion_factor
         results.append({
             "ID": label,
             "X_pixel": centroid[0],
@@ -159,7 +164,7 @@ def process_image(image_path, green_thresh=60, red_thresh=60, median_ksize=3,
             "Type": cell_type,
             "Hex": hex_val
         })
-        # Annotate overlay image with a circle and label
+        # Annotate overlay image
         center_coords = (int(round(centroid[0])), int(round(centroid[1])))
         if cell_type == "EGFP":
             draw_color = (0, 255, 0)  # Green (RGB)
@@ -175,59 +180,134 @@ def process_image(image_path, green_thresh=60, red_thresh=60, median_ksize=3,
     
     return results, overlay
 
-def save_results(results, overlay, output_folder="output", save_csv=True, save_overlay=True):
+def save_results(results, overlay, base_filename, output_dir, save_csv=True, save_overlay=True):
     """
-    Save results to a CSV file and the annotated overlay image.
+    Save the results to a CSV file and the annotated overlay image.
+    
+    Parameters:
+        results: List of dictionaries with cell data.
+        overlay: Annotated overlay image.
+        base_filename: Base name of the input image (without extension).
+        output_dir: Directory to save the outputs.
+        save_csv: Whether to save the CSV file.
+        save_overlay: Whether to save the overlay image.
     """
     if save_csv:
         df = pd.DataFrame(results)
-        csv_filename = f"{output_folder}/soma.csv"
+        csv_filename = os.path.join(output_dir, f"{base_filename}_soma.csv")
         df.to_csv(csv_filename, index=False)
         print(f"CSV file saved: {csv_filename}")
     if save_overlay:
         overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-        overlay_filename = f"{output_folder}/overlay.png"
+        overlay_filename = os.path.join(output_dir, f"{base_filename}_overlay.png")
         cv2.imwrite(overlay_filename, overlay_bgr)
         print(f"Overlay image saved: {overlay_filename}")
 
+def process_directory(input_dir, intensity_thresh=60, diameter=None, conversion_factor=1/1.6091,
+                      cellpose_model=None, channels=[0,0], flow_threshold=0.4, cellprob_threshold=0.0,
+                      save_csv=True, save_overlay=True, output_dir="output"):
+    """
+    Process all images in the specified directory.
+    
+    Parameters:
+        input_dir: Directory containing input images.
+        intensity_thresh: Intensity threshold for fluorescence classification.
+        diameter: Estimated cell diameter for Cellpose segmentation (optional).
+        conversion_factor: Factor to convert pixel coordinates to microns.
+        cellpose_model: Preloaded Cellpose model.
+        channels: List specifying which channels to use for Cellpose.
+        flow_threshold: Flow threshold for Cellpose segmentation.
+        cellprob_threshold: Cell probability threshold for Cellpose segmentation.
+        save_csv: Flag to save CSV outputs.
+        save_overlay: Flag to save overlay images.
+        output_dir: Directory to save output files (default: 'output').
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # Supported image extensions.
+    valid_ext = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')
+    image_files = [f for f in os.listdir(input_dir) if f.lower().endswith(valid_ext)]
+    
+    if not image_files:
+        print("No valid image files found in the directory.")
+        return
+    
+    for image_file in image_files:
+        image_path = os.path.join(input_dir, image_file)
+        print(f"Processing {image_path}...")
+        try:
+            results, overlay = process_image(
+                image_path, intensity_thresh, diameter, conversion_factor, cellpose_model,
+                channels, flow_threshold, cellprob_threshold
+            )
+            base_filename, _ = os.path.splitext(image_file)
+            save_results(results, overlay, base_filename, output_dir, save_csv, save_overlay)
+        except Exception as e:
+            print(f"Failed to process {image_path}: {e}")
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Automated Soma Counting in Fluorescent Microscopy Images"
+        description="Automated Soma Counting in Fluorescent Microscopy Images using Cellpose on a Directory"
     )
-    parser.add_argument("image_path", help="Path to the input image")
-    parser.add_argument("--green_thresh", type=int, default=60,
-                        help="Intensity threshold for green channel (default: 60)")
-    parser.add_argument("--red_thresh", type=int, default=60,
-                        help="Intensity threshold for red channel (default: 60)")
-    parser.add_argument("--median_ksize", type=int, default=3,
-                        help="Kernel size for median filtering (default: 3)")
-    parser.add_argument("--gaussian_sigma", type=float, default=1.0,
-                        help="Sigma for Gaussian blur (default: 1.0)")
-    parser.add_argument("--min_area", type=int, default=40,
-                        help="Minimum area (in pixels) for a region to be considered a soma (default: 40)")
-    parser.add_argument("--min_distance", type=int, default=10,
-                        help="Minimum distance between peaks in watershed segmentation (default: 10)")
-    parser.add_argument("--output_folder", type=str, default="output",
-                        help="Folder for output files (default: 'output')")
-    parser.add_argument("--save_csv", action="store_true",
-                        help="Flag to save the CSV file")
-    parser.add_argument("--save_overlay", action="store_true",
-                        help="Flag to save the overlay image")
+    parser.add_argument("input_dir", nargs="?", default="input",
+                        help="Path to the directory containing input images (default: 'input')")
+    parser.add_argument("--intensity_thresh", type=int, default=60,
+                        help="Intensity threshold for fluorescence classification (default: 60)")
+    parser.add_argument("--diameter", type=float, default=None,
+                        help="Estimated cell diameter for Cellpose segmentation (optional)")
+    parser.add_argument("--pixels_per_micron", type=float, default=1.6091,
+                        help="Number of pixels per micron (default: 1.6091)")
+    parser.add_argument("--cellpose_model_type", type=str, default="cyto3",
+                        help="Cellpose model type (default: 'cyto3')")
+    parser.add_argument("--no_gpu", dest="cellpose_gpu", action="store_false",
+                        help="Disable GPU for Cellpose segmentation")
+    parser.set_defaults(cellpose_gpu=True)
+    parser.add_argument("--cellpose_flow_threshold", type=float, default=0.4,
+                        help="Flow threshold for Cellpose segmentation (default: 0.4)")
+    parser.add_argument("--cellpose_cellprob_threshold", type=float, default=0.0,
+                        help="Cell probability threshold for Cellpose segmentation (default: 0.0)")
+    parser.add_argument("--cellpose_channels", type=str, default="0,0",
+                        help="Channels for Cellpose segmentation as a comma-separated list (default: '0,0')")
+    parser.add_argument("--no_csv", dest="save_csv", action="store_false",
+                        help="Do not save CSV files")
+    parser.set_defaults(save_csv=True)
+    parser.add_argument("--no_overlay", dest="save_overlay", action="store_false",
+                        help="Do not save overlay images")
+    parser.set_defaults(save_overlay=True)
+    parser.add_argument("--output_dir", type=str, default="output",
+                        help="Directory to save output files (default: 'output')")
     
     args = parser.parse_args()
     
-    results, overlay = process_image(
-        args.image_path,
-        green_thresh=args.green_thresh,
-        red_thresh=args.red_thresh,
-        median_ksize=args.median_ksize,
-        gaussian_sigma=args.gaussian_sigma,
-        min_area=args.min_area,
-        min_distance=args.min_distance
+    # Compute conversion factor (pixels -> microns)
+    conversion_factor = 1 / args.pixels_per_micron
+    
+    # Parse cellpose channels from a comma-separated string into a list of ints.
+    try:
+        channels = [int(ch.strip()) for ch in args.cellpose_channels.split(',')]
+    except Exception as e:
+        raise ValueError("Error parsing cellpose_channels. It should be a comma-separated list of integers, e.g., '0,0'.")
+    
+    # Instantiate a Cellpose model using provided parameters.
+    cellpose_model = models.Cellpose(
+        model_type=args.cellpose_model_type,
+        gpu=args.cellpose_gpu
     )
     
-    save_results(results, overlay, output_folder=args.output_folder,
-                 save_csv=args.save_csv, save_overlay=args.save_overlay)
+    process_directory(
+        args.input_dir,
+        intensity_thresh=args.intensity_thresh,
+        diameter=args.diameter,
+        conversion_factor=conversion_factor,
+        cellpose_model=cellpose_model,
+        channels=channels,
+        flow_threshold=args.cellpose_flow_threshold,
+        cellprob_threshold=args.cellpose_cellprob_threshold,
+        save_csv=args.save_csv,
+        save_overlay=args.save_overlay,
+        output_dir=args.output_dir
+    )
 
 if __name__ == "__main__":
     main()
