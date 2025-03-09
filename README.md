@@ -1,2 +1,3 @@
-* `poetry run python soma-chatgpt.py`
-* `poetry run python soma-claude.py`
+## Soma Cell Segmentation
+
+Command: `poetry run python soma.py`
