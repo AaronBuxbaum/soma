@@ -7,8 +7,10 @@ Install:
 
 Setup:
 1. Open `Terminal` and run `cd ~/Desktop/soma`
-2. Install Poetry: `curl -sSL https://install.python-poetry.org | python3 -`
-3. Install dependencies: `poetry install`
+2. Install Homebrew: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
+  * there may be steps that it asks you to do at the end. If there are, do them.
+3. Install Poetry: `brew install poetry`
+4. Install dependencies: `poetry install`
 
 Run:
 1. Open `Terminal` and run `cd ~/Desktop/soma`
