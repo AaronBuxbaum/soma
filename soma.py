@@ -453,15 +453,15 @@ def main():
     parser.add_argument("--dapi_count_threshold", type=int, default=5,
                         help="Minimum DAPI pixels for a valid nucleus (default: 5)")
     # Cytoplasmic segmentation.
-    parser.add_argument("--cyto_flow_threshold", type=float, default=0.3,
+    parser.add_argument("--cyto_flow_threshold", type=float, default=0.3, # TODO
                         help="Flow threshold for cytoplasmic segmentation (default: 0.3)")
-    parser.add_argument("--cyto_cellprob_threshold", type=float, default=0.0,
+    parser.add_argument("--cyto_cellprob_threshold", type=float, default=0.0, # TODO
                         help="Cell probability threshold for cytoplasmic segmentation (default: 0.0)")
     parser.add_argument("--overlap_threshold", type=float, default=0.5,
                         help="Overlap threshold for combining contours (default: 0.5)")
     parser.add_argument("--cellpose-model", type=str, default="cyto3",
                         help="Cellpose model type (cyto3, nuclei)")
-    parser.add_argument("--dapi-use-nuclei-model", action="store_true",
+    parser.add_argument("--dapi-use-nuclei-model", action="store_true", # TODO
                         help="Use nuclei model for DAPI segmentation (default uses threshold)")
     parser.add_argument("--use-gpu", type=bool, default=True,
                         help="Use GPU for Cellpose (default: True)")
@@ -470,22 +470,20 @@ def main():
     parser.add_argument("--cellpose-batch-size", type=int, default=8,
                         help="Batch size for Cellpose (default: 8)")
     # Cell diameters (in microns); if None, auto-estimation is used.
-    parser.add_argument("--default-cell-diameter", type=float, default=None,
-                        help="Default cell diameter in microns")
-    parser.add_argument("--dapi-cell-diameter", type=float, default=None,
+    parser.add_argument("--dapi-cell-diameter", type=float, default=None, # TODO
                         help="DAPI cell diameter in microns")
     parser.add_argument("--red-cell-diameter", type=float, default=None,
                         help="Red cell diameter in microns")
     parser.add_argument("--green-cell-diameter", type=float, default=None,
                         help="Green cell diameter in microns")
     # Additional thresholds.
-    parser.add_argument("--default-flow-threshold", type=float, default=0.4,
+    parser.add_argument("--default-flow-threshold", type=float, default=0.4, # TODO
                         help="Default flow threshold for cell detection")
-    parser.add_argument("--default-cellprob-threshold", type=float, default=0.0,
+    parser.add_argument("--default-cellprob-threshold", type=float, default=0.0, # TODO
                         help="Default cell probability threshold")
-    parser.add_argument("--dapi-flow-threshold", type=float, default=0.4,
+    parser.add_argument("--dapi-flow-threshold", type=float, default=0.4, # TODO
                         help="Flow threshold for DAPI cell detection")
-    parser.add_argument("--dapi-cellprob-threshold", type=float, default=0.0,
+    parser.add_argument("--dapi-cellprob-threshold", type=float, default=0.0, # TODO
                         help="Cell probability threshold for DAPI")
     parser.add_argument("--red-flow-threshold", type=float, default=0.4,
                         help="Flow threshold for red cell detection")
