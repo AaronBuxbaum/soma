@@ -6,6 +6,7 @@ import argparse
 from cellpose import models
 import tifffile
 import pandas as pd
+import torch
 import matplotlib.pyplot as plt
 
 # ---------------- Preprocessing Functions ----------------
@@ -106,47 +107,68 @@ def filter_contours_by_dapi_content(contours, dapi_mask, dapi_count_threshold):
             valid.append(contour)
     return valid
 
-def combine_coexpressed_contours(red_contours, green_contours, overlap_threshold):
+def compute_centroid(contour):
+    M = cv2.moments(contour)
+    if M["m00"] != 0:
+        return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+    return (0, 0)
+
+def combine_coexpressed_contours(red_contours, green_contours, overlap_threshold, pixels_per_micron, distance_threshold_microns = 50):
     coexpressed_contours = []
     red_used = [False] * len(red_contours)
     green_used = [False] * len(green_contours)
+    distance_threshold_pixels = distance_threshold_microns * pixels_per_micron
+    red_centroids = [compute_centroid(r) for r in red_contours]
+    green_centroids = [compute_centroid(g) for g in green_contours]
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     for i, r in enumerate(red_contours):
         if red_used[i]:
             continue
         for j, g in enumerate(green_contours):
             if green_used[j]:
                 continue
+
+            c1 = red_centroids[i]
+            c2 = green_centroids[j]
+            centroid_distance = np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+            if centroid_distance > distance_threshold_pixels:
+                continue
+
             all_points = np.vstack((r, g))
             x, y, w, h = cv2.boundingRect(all_points)
-            mask_r = np.zeros((h, w), dtype=np.uint8)
-            mask_g = np.zeros((h, w), dtype=np.uint8)
-            r_shifted = r - [x, y]
-            g_shifted = g - [x, y]
-            cv2.fillPoly(mask_r, [r_shifted], 255)
-            cv2.fillPoly(mask_g, [g_shifted], 255)
-            intersection = cv2.bitwise_and(mask_r, mask_g)
-            intersection_area = np.count_nonzero(intersection)
+            mask_r_cpu = np.zeros((h, w), dtype=np.uint8)
+            mask_g_cpu = np.zeros((h, w), dtype=np.uint8)
+            r_shifted = r - np.array([x, y])
+            g_shifted = g - np.array([x, y])
+            cv2.fillPoly(mask_r_cpu, [r_shifted], 255)
+            cv2.fillPoly(mask_g_cpu, [g_shifted], 255)
+            mask_r = torch.from_numpy(mask_r_cpu).to(device)
+            mask_g = torch.from_numpy(mask_g_cpu).to(device)
+            intersection = torch.logical_and(mask_r, mask_g)
+            intersection_area = int(torch.sum(intersection).item())
             area_r = cv2.contourArea(r)
             area_g = cv2.contourArea(g)
             union_area = area_r + area_g - intersection_area
             if union_area <= 0:
                 continue
             iou = intersection_area / union_area
+            
             if iou >= overlap_threshold:
                 combined = cv2.convexHull(np.vstack((r, g)))
                 coexpressed_contours.append(combined)
                 red_used[i] = True
                 green_used[j] = True
                 break
+
     remaining_red = [c for idx, c in enumerate(red_contours) if not red_used[idx]]
     remaining_green = [c for idx, c in enumerate(green_contours) if not green_used[idx]]
     return remaining_red, remaining_green, coexpressed_contours
 
-def draw_overlay(composite, dapi_mask, tdtomato_mask, egfp_mask, dapi_count_threshold, overlap_threshold):
+def draw_overlay(composite, dapi_mask, tdtomato_mask, egfp_mask, dapi_count_threshold, overlap_threshold, pixels_per_micron):
     overlay = composite.copy()
     red_contours = filter_contours_by_dapi_content(find_contours(tdtomato_mask), dapi_mask, dapi_count_threshold)
     green_contours = filter_contours_by_dapi_content(find_contours(egfp_mask), dapi_mask, dapi_count_threshold)
-    red_contours, green_contours, coexpressed_contours = combine_coexpressed_contours(red_contours, green_contours, overlap_threshold)
+    red_contours, green_contours, coexpressed_contours = combine_coexpressed_contours(red_contours, green_contours, overlap_threshold, pixels_per_micron)
     print({
         "tdTomato": len(red_contours),
         "EGFP": len(green_contours),
@@ -284,10 +306,49 @@ def save_binary_mask(mask, path):
     cv2.imwrite(path, binary_mask)
     print(f"Mask saved: {path}")
 
+# ---------------- Output Generation Functions ----------------
+
+def build_output(args, composite, dapi_mask, td_mask, egfp_mask):
+    overlay, red_contours, green_contours, coexpressed_contours = draw_overlay(composite, dapi_mask, td_mask, egfp_mask, args.dapi_count_threshold, args.overlap_threshold, args.pixels_per_micron)
+    overlay_path = os.path.join(args.out_subfolder, "composite_overlay.png")
+    cv2.imwrite(overlay_path, overlay)
+    print(f"Overlay image saved: {overlay_path}")
+    if args.save_masks:
+        save_binary_mask(dapi_mask, os.path.join(args.out_subfolder, "dapi_mask.png"))
+        save_binary_mask(td_mask, os.path.join(args.out_subfolder, "tdtomato_mask.png"))
+        save_binary_mask(egfp_mask, os.path.join(args.out_subfolder, "egfp_mask.png"))
+    
+    df = export_cell_data(red_contours, green_contours, coexpressed_contours, args.out_subfolder, args.pixels_per_micron)
+    create_bar_chart(df, args.out_subfolder)
+    create_cells_only_image(dapi_mask.shape, red_contours, green_contours, coexpressed_contours, args.out_subfolder)
+    create_cells_colored_image(dapi_mask.shape, red_contours, green_contours, coexpressed_contours, args.out_subfolder)
+    create_scatter_plot(df, args.out_subfolder)
+    create_area_histogram(df, args.out_subfolder, args.pixels_per_micron)
+    create_diameter_histogram(df, args.out_subfolder, args.pixels_per_micron)
+
+def handle_coexpression_testing(args):
+    print("Coexpression testing mode: loading previously saved files.")
+    composite_path = os.path.join(args.out_subfolder, "composite_overlay.png")
+    dapi_mask_path = os.path.join(args.out_subfolder, "dapi_mask.png")
+    tdtomato_mask_path = os.path.join(args.out_subfolder, "tdtomato_mask.png")
+    egfp_mask_path = os.path.join(args.out_subfolder, "egfp_mask.png")
+    composite = cv2.imread(composite_path)
+    dapi_mask = cv2.imread(dapi_mask_path, cv2.IMREAD_GRAYSCALE)
+    td_mask = cv2.imread(tdtomato_mask_path, cv2.IMREAD_GRAYSCALE)
+    egfp_mask = cv2.imread(egfp_mask_path, cv2.IMREAD_GRAYSCALE)
+    if composite is None or dapi_mask is None or td_mask is None or egfp_mask is None:
+        raise FileNotFoundError("One or more required saved files for coexpression testing were not found.")
+    build_output(args, composite, dapi_mask, td_mask, egfp_mask)
+
 # ---------------- Main Processing Function ----------------
 
 def process_file(file_path, args):
     print(f"Processing file: {file_path}")
+
+    if args.coexpression_testing:
+        handle_coexpression_testing(args)
+        return
+
     multi_img = load_multichannel_tiff(file_path)
     dapi_page = multi_img[0]
     td_page = multi_img[1]
@@ -365,24 +426,7 @@ def process_file(file_path, args):
                                   augment=args.cellpose_augment,
                                   batch_size=args.cellpose_batch_size)
     print("Channel masks computed.")
-    overlay, red_contours, green_contours, coexpressed_contours = draw_overlay(
-        composite, dapi_mask, td_mask, egfp_mask,
-        args.dapi_count_threshold, args.overlap_threshold)
-    overlay_path = os.path.join(args.out_subfolder, "composite_overlay.png")
-    cv2.imwrite(overlay_path, overlay)
-    print(f"Overlay image saved: {overlay_path}")
-    if args.save_masks:
-        save_binary_mask(dapi_mask, os.path.join(args.out_subfolder, "dapi_mask.png"))
-        save_binary_mask(td_mask, os.path.join(args.out_subfolder, "tdtomato_mask.png"))
-        save_binary_mask(egfp_mask, os.path.join(args.out_subfolder, "egfp_mask.png"))
-    
-    df = export_cell_data(red_contours, green_contours, coexpressed_contours, args.out_subfolder, args.pixels_per_micron)
-    create_bar_chart(df, args.out_subfolder)
-    _ = create_cells_only_image(dapi_img.shape, red_contours, green_contours, coexpressed_contours, args.out_subfolder)
-    create_cells_colored_image(dapi_img.shape, red_contours, green_contours, coexpressed_contours, args.out_subfolder)
-    create_scatter_plot(df, args.out_subfolder)
-    create_area_histogram(df, args.out_subfolder, args.pixels_per_micron)
-    create_diameter_histogram(df, args.out_subfolder, args.pixels_per_micron)
+    build_output(args, composite, dapi_mask, td_mask, egfp_mask)
 
 # ---------------- Main Entry Point and Argument Parsing ----------------
 
@@ -397,8 +441,6 @@ def main():
                         help="Directory to save the output folders (default: 'output')")
     parser.add_argument("--pixels_per_micron", type=float, default=1.6091,
                         help="Number of pixels per micron (default: 1.6091)")
-    parser.add_argument("--estimated_diameter", type=float, default=None,
-                        help="Estimated cell diameter in microns (default: None; auto-estimated by Cellpose)")
     # DAPI segmentation.
     parser.add_argument("--dapi_threshold", type=int, default=200,
                         help="Fixed threshold for DAPI segmentation (default: 200)")
@@ -421,7 +463,7 @@ def main():
                         help="Cellpose model type (cyto3, nuclei)")
     parser.add_argument("--dapi-use-nuclei-model", action="store_true",
                         help="Use nuclei model for DAPI segmentation (default uses threshold)")
-    parser.add_argument("--use-gpu", action="store_true", default=True,
+    parser.add_argument("--use-gpu", type=bool, default=True,
                         help="Use GPU for Cellpose (default: True)")
     parser.add_argument("--cellpose-augment", action="store_true", default=True,
                         help="Use Cellpose augmentation (default: True)")
@@ -491,16 +533,11 @@ def main():
                         help="Configure DAPI segmentation only; do not proceed with cytoplasmic segmentation")
     parser.add_argument("--save_masks", action="store_true", default=True,
                         help="Also save segmentation masks (default: True)")
-    
+    parser.add_argument("--coexpression_testing", action="store_true",
+                        help="Run coexpression testing by loading saved output files and re-running the overlay script")
+
     args = parser.parse_args()
-    
-    if args.estimated_diameter is None:
-        args.estimated_diameter_pixels = None
-        print("No estimated cell diameter provided; Cellpose will auto-estimate.")
-    else:
-        args.estimated_diameter_pixels = args.estimated_diameter * args.pixels_per_micron
-        print(f"Using cell diameter: {args.estimated_diameter} microns, which is {args.estimated_diameter_pixels:.2f} pixels")
-    
+
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     
