@@ -306,10 +306,18 @@ def save_binary_mask(mask, path):
     cv2.imwrite(path, binary_mask)
     print(f"Mask saved: {path}")
 
-# ---------------- Output Generation Functions ----------------
+def handle_overlay_generation(composite, dapi_mask, td_mask, egfp_mask, args):
+    overlay, red_contours, green_contours, coexpressed_contours = draw_overlay(
+        composite, dapi_mask, td_mask, egfp_mask,
+        args.dapi_count_threshold, args.overlap_threshold, args.pixels_per_micron
+    )
 
-def build_output(args, composite, dapi_mask, td_mask, egfp_mask):
-    overlay, red_contours, green_contours, coexpressed_contours = draw_overlay(composite, dapi_mask, td_mask, egfp_mask, args.dapi_count_threshold, args.overlap_threshold, args.pixels_per_micron)
+    if args.save_contours:
+        np.save(os.path.join(args.out_subfolder, "dapi_mask.npy"), dapi_mask)
+        np.save(os.path.join(args.out_subfolder, "red_contours.npy"), red_contours)
+        np.save(os.path.join(args.out_subfolder, "green_contours.npy"), green_contours)
+        np.save(os.path.join(args.out_subfolder, "coexpressed_contours.npy"), coexpressed_contours)
+
     overlay_path = os.path.join(args.out_subfolder, "composite_overlay.png")
     cv2.imwrite(overlay_path, overlay)
     print(f"Overlay image saved: {overlay_path}")
@@ -318,6 +326,11 @@ def build_output(args, composite, dapi_mask, td_mask, egfp_mask):
         save_binary_mask(td_mask, os.path.join(args.out_subfolder, "tdtomato_mask.png"))
         save_binary_mask(egfp_mask, os.path.join(args.out_subfolder, "egfp_mask.png"))
     
+    return composite, dapi_mask, td_mask, egfp_mask, red_contours, green_contours, coexpressed_contours
+
+# ---------------- Output Generation Functions ----------------
+
+def build_output(args, dapi_mask, red_contours, green_contours, coexpressed_contours):
     df = export_cell_data(red_contours, green_contours, coexpressed_contours, args.out_subfolder, args.pixels_per_micron)
     create_bar_chart(df, args.out_subfolder)
     create_cells_only_image(dapi_mask.shape, red_contours, green_contours, coexpressed_contours, args.out_subfolder)
@@ -328,17 +341,11 @@ def build_output(args, composite, dapi_mask, td_mask, egfp_mask):
 
 def handle_coexpression_testing(args):
     print("Coexpression testing mode: loading previously saved files.")
-    composite_path = os.path.join(args.out_subfolder, "composite_overlay.png")
-    dapi_mask_path = os.path.join(args.out_subfolder, "dapi_mask.png")
-    tdtomato_mask_path = os.path.join(args.out_subfolder, "tdtomato_mask.png")
-    egfp_mask_path = os.path.join(args.out_subfolder, "egfp_mask.png")
-    composite = cv2.imread(composite_path)
-    dapi_mask = cv2.imread(dapi_mask_path, cv2.IMREAD_GRAYSCALE)
-    td_mask = cv2.imread(tdtomato_mask_path, cv2.IMREAD_GRAYSCALE)
-    egfp_mask = cv2.imread(egfp_mask_path, cv2.IMREAD_GRAYSCALE)
-    if composite is None or dapi_mask is None or td_mask is None or egfp_mask is None:
-        raise FileNotFoundError("One or more required saved files for coexpression testing were not found.")
-    build_output(args, composite, dapi_mask, td_mask, egfp_mask)
+    dapi_mask = np.load(os.path.join(args.out_subfolder, "dapi_mask.npy"), allow_pickle=True)
+    red_contours = np.load(os.path.join(args.out_subfolder, "red_contours.npy"), allow_pickle=True)
+    green_contours = np.load(os.path.join(args.out_subfolder, "green_contours.npy"), allow_pickle=True)
+    coexpressed_contours = np.load(os.path.join(args.out_subfolder, "coexpressed_contours.npy"), allow_pickle=True)
+    build_output(args, dapi_mask, red_contours, green_contours, coexpressed_contours)
 
 # ---------------- Main Processing Function ----------------
 
@@ -398,11 +405,22 @@ def process_file(file_path, args):
     
     composite = create_composite(dapi_img, td_img, egfp_img)
     
-    # DAPI segmentation: adaptive threshold if enabled, otherwise fixed.
-    if args.adaptive_threshold:
-        dapi_mask = segment_dapi_adaptive(dapi_img, args.adaptive_block_size, args.adaptive_C)
+    # ---------------- DAPI Segmentation ----------------
+    # If the user has enabled dapi nuclei segmentation, use Cellpose with the provided DAPI-specific parameters.
+    if args.dapi_use_nuclei_model:
+        dapi_diameter_pixels = args.dapi_cell_diameter * args.pixels_per_micron if args.dapi_cell_diameter is not None else None
+        cyto_model = models.Cellpose(model_type=args.cellpose_model, gpu=args.use_gpu)
+        dapi_mask = segment_channel(dapi_img, cyto_model, diameter=dapi_diameter_pixels,
+                                    flow_threshold=args.dapi_flow_threshold,
+                                    cellprob_threshold=args.dapi_cellprob_threshold,
+                                    augment=args.cellpose_augment,
+                                    batch_size=args.cellpose_batch_size)
     else:
-        dapi_mask = segment_dapi_fixed(dapi_img, threshold=args.dapi_threshold)
+        if args.adaptive_threshold:
+            dapi_mask = segment_dapi_adaptive(dapi_img, args.adaptive_block_size, args.adaptive_C)
+        else:
+            dapi_mask = segment_dapi_fixed(dapi_img, threshold=args.dapi_threshold)
+    
     print("DAPI mask computed.")
     if args.save_masks:
         dapi_mask_path = os.path.join(args.out_subfolder, "dapi_mask.png")
@@ -410,23 +428,29 @@ def process_file(file_path, args):
     if args.configure_dapi:
         return
 
-    # Convert cell diameters (provided in microns) to pixels.
+    # ---------------- Cytoplasmic (Red/Green) Segmentation ----------------
     red_diameter_pixels = args.red_cell_diameter * args.pixels_per_micron if args.red_cell_diameter is not None else None
     green_diameter_pixels = args.green_cell_diameter * args.pixels_per_micron if args.green_cell_diameter is not None else None
 
     cyto_model = models.Cellpose(model_type=args.cellpose_model, gpu=args.use_gpu)
+    red_flow_threshold = args.red_flow_threshold if args.red_flow_threshold is not None else args.default_flow_threshold
+    red_cellprob_threshold = args.red_cellprob_threshold if args.red_cellprob_threshold is not None else args.default_cellprob_threshold
+    green_flow_threshold = args.green_flow_threshold if args.green_flow_threshold is not None else args.default_flow_threshold
+    green_cellprob_threshold = args.green_cellprob_threshold if args.green_cellprob_threshold is not None else args.default_cellprob_threshold
+
     td_mask = segment_channel(td_img, cyto_model, diameter=red_diameter_pixels,
-                                flow_threshold=args.red_flow_threshold,
-                                cellprob_threshold=args.red_cellprob_threshold,
+                                flow_threshold=red_flow_threshold,
+                                cellprob_threshold=red_cellprob_threshold,
                                 augment=args.cellpose_augment,
                                 batch_size=args.cellpose_batch_size)
     egfp_mask = segment_channel(egfp_img, cyto_model, diameter=green_diameter_pixels,
-                                  flow_threshold=args.green_flow_threshold,
-                                  cellprob_threshold=args.green_cellprob_threshold,
+                                  flow_threshold=green_flow_threshold,
+                                  cellprob_threshold=green_cellprob_threshold,
                                   augment=args.cellpose_augment,
                                   batch_size=args.cellpose_batch_size)
     print("Channel masks computed.")
-    build_output(args, composite, dapi_mask, td_mask, egfp_mask)
+    args, dapi_mask, red_contours, green_contours, coexpressed_contours = handle_overlay_generation(composite, dapi_mask, td_mask, egfp_mask, args)
+    build_output(args, dapi_mask, red_contours, green_contours, coexpressed_contours)
 
 # ---------------- Main Entry Point and Argument Parsing ----------------
 
@@ -453,86 +477,85 @@ def main():
     parser.add_argument("--dapi_count_threshold", type=int, default=5,
                         help="Minimum DAPI pixels for a valid nucleus (default: 5)")
     # Cytoplasmic segmentation.
-    parser.add_argument("--cyto_flow_threshold", type=float, default=0.3, # TODO
-                        help="Flow threshold for cytoplasmic segmentation (default: 0.3)")
-    parser.add_argument("--cyto_cellprob_threshold", type=float, default=0.0, # TODO
-                        help="Cell probability threshold for cytoplasmic segmentation (default: 0.0)")
-    parser.add_argument("--overlap_threshold", type=float, default=0.5,
-                        help="Overlap threshold for combining contours (default: 0.5)")
-    parser.add_argument("--cellpose-model", type=str, default="cyto3",
+    parser.add_argument("--overlap_threshold", type=float, default=0.85,
+                        help="Overlap threshold for combining contours (default: 0.85)")
+    parser.add_argument("--cellpose_model", type=str, default="cyto3",
                         help="Cellpose model type (cyto3, nuclei)")
-    parser.add_argument("--dapi-use-nuclei-model", action="store_true", # TODO
+    parser.add_argument("--dapi_use_nuclei_model", action="store_true",
                         help="Use nuclei model for DAPI segmentation (default uses threshold)")
-    parser.add_argument("--use-gpu", type=bool, default=True,
+    # Use GPU.
+    parser.add_argument("--use_gpu", action="store_false", default=True,
                         help="Use GPU for Cellpose (default: True)")
-    parser.add_argument("--cellpose-augment", action="store_true", default=True,
+    parser.add_argument("--cellpose_augment", action="store_false", default=True,
                         help="Use Cellpose augmentation (default: True)")
-    parser.add_argument("--cellpose-batch-size", type=int, default=8,
+    parser.add_argument("--cellpose_batch_size", type=int, default=8,
                         help="Batch size for Cellpose (default: 8)")
     # Cell diameters (in microns); if None, auto-estimation is used.
-    parser.add_argument("--dapi-cell-diameter", type=float, default=None, # TODO
+    parser.add_argument("--dapi_cell_diameter", type=float, default=None,
                         help="DAPI cell diameter in microns")
-    parser.add_argument("--red-cell-diameter", type=float, default=None,
+    parser.add_argument("--red_cell_diameter", type=float, default=None,
                         help="Red cell diameter in microns")
-    parser.add_argument("--green-cell-diameter", type=float, default=None,
+    parser.add_argument("--green_cell_diameter", type=float, default=None,
                         help="Green cell diameter in microns")
     # Additional thresholds.
-    parser.add_argument("--default-flow-threshold", type=float, default=0.4, # TODO
+    parser.add_argument("--default_flow_threshold", type=float, default=0.4,
                         help="Default flow threshold for cell detection")
-    parser.add_argument("--default-cellprob-threshold", type=float, default=0.0, # TODO
+    parser.add_argument("--default_cellprob_threshold", type=float, default=0.0,
                         help="Default cell probability threshold")
-    parser.add_argument("--dapi-flow-threshold", type=float, default=0.4, # TODO
+    parser.add_argument("--dapi_flow_threshold", type=float, default=0.4,
                         help="Flow threshold for DAPI cell detection")
-    parser.add_argument("--dapi-cellprob-threshold", type=float, default=0.0, # TODO
+    parser.add_argument("--dapi_cellprob_threshold", type=float, default=0.0,
                         help="Cell probability threshold for DAPI")
-    parser.add_argument("--red-flow-threshold", type=float, default=0.4,
+    parser.add_argument("--red_flow_threshold", type=float, default=0.4,
                         help="Flow threshold for red cell detection")
-    parser.add_argument("--red-cellprob-threshold", type=float, default=0.0,
+    parser.add_argument("--red_cellprob_threshold", type=float, default=0.0,
                         help="Cell probability threshold for red channel")
-    parser.add_argument("--green-flow-threshold", type=float, default=0.4,
+    parser.add_argument("--green_flow_threshold", type=float, default=0.4,
                         help="Flow threshold for green cell detection")
-    parser.add_argument("--green-cellprob-threshold", type=float, default=0.0,
+    parser.add_argument("--green_cellprob_threshold", type=float, default=0.0,
                         help="Cell probability threshold for green channel")
     # Preprocessing options.
-    parser.add_argument("--enhance-contrast", action="store_true", default=True,
-                        help="Enhance contrast using CLAHE (default: True)")
-    parser.add_argument("--denoise", action="store_true", default=True,
-                        help="Apply Gaussian denoising (default: True)")
-    parser.add_argument("--denoise-sigma", type=float, default=1.0,
+    parser.add_argument("--enhance_contrast", action="store_true", default=False,
+                        help="Enhance contrast using CLAHE (default: False)")
+    parser.add_argument("--denoise", action="store_true", default=False,
+                        help="Apply Gaussian denoising (default: False)")
+    parser.add_argument("--denoise_sigma", type=float, default=1.0,
                         help="Sigma for Gaussian denoising (default: 1.0)")
-    parser.add_argument("--rolling-ball", action="store_true",
+    parser.add_argument("--rolling_ball", action="store_true", default=False,
                         help="Apply rolling ball background subtraction")
-    parser.add_argument("--rolling-ball-radius", type=float, default=50.0,
-                        help="Radius for rolling ball subtraction in pixels (default: 50.0)")
-    parser.add_argument("--median-filter", action="store_true", default=False,
+    parser.add_argument("--rolling_ball_radius", type=float, default=20.0,
+                        help="Radius for rolling ball subtraction in pixels (default: 20.0)")
+    parser.add_argument("--median_filter", action="store_true", default=False,
                         help="Apply median filtering (default: False)")
-    parser.add_argument("--median-kernel-size", type=int, default=3,
+    parser.add_argument("--median_kernel_size", type=int, default=3,
                         help="Kernel size for median filtering (must be odd, default: 3)")
-    parser.add_argument("--bilateral-filter", action="store_true", default=False,
+    parser.add_argument("--bilateral_filter", action="store_true", default=False,
                         help="Apply bilateral filtering (default: False)")
-    parser.add_argument("--bilateral-d", type=int, default=9,
+    parser.add_argument("--bilateral_d", type=int, default=9,
                         help="Diameter for bilateral filter (default: 9)")
-    parser.add_argument("--bilateral-sigmaColor", type=float, default=75.0,
+    parser.add_argument("--bilateral_sigmaColor", type=float, default=75.0,
                         help="SigmaColor for bilateral filter (default: 75.0)")
-    parser.add_argument("--bilateral-sigmaSpace", type=float, default=75.0,
+    parser.add_argument("--bilateral_sigmaSpace", type=float, default=75.0,
                         help="SigmaSpace for bilateral filter (default: 75.0)")
-    parser.add_argument("--hist-eq", action="store_true", default=False,
+    parser.add_argument("--hist_eq", action="store_true", default=False,
                         help="Apply histogram equalization (default: False)")
-    parser.add_argument("--gamma-correction", action="store_true", default=False,
+    parser.add_argument("--gamma_correction", action="store_true", default=False,
                         help="Apply gamma correction (default: False)")
     parser.add_argument("--gamma", type=float, default=1.0,
                         help="Gamma value (default: 1.0)")
-    parser.add_argument("--morph-close", action="store_true", default=False,
+    parser.add_argument("--morph_close", action="store_true", default=False,
                         help="Apply morphological closing (default: False)")
-    parser.add_argument("--morph-close-kernel-size", type=int, default=5,
+    parser.add_argument("--morph_close_kernel_size", type=int, default=5,
                         help="Kernel size for morphological closing (default: 5)")
     # Additional flags.
     parser.add_argument("--configure_dapi", action="store_true",
                         help="Configure DAPI segmentation only; do not proceed with cytoplasmic segmentation")
     parser.add_argument("--save_masks", action="store_true", default=True,
                         help="Also save segmentation masks (default: True)")
+    parser.add_argument("--save_contours", action="store_true", default=False,
+                        help="Also save contours (default: False)")
     parser.add_argument("--coexpression_testing", action="store_true",
-                        help="Run coexpression testing by loading saved output files and re-running the overlay script")
+                        help="Run coexpression testing by loading saved contours and re-running the overlay script")
 
     args = parser.parse_args()
 
