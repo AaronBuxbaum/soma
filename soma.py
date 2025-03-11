@@ -449,7 +449,7 @@ def process_file(file_path, args):
                                   augment=args.cellpose_augment,
                                   batch_size=args.cellpose_batch_size)
     print("Channel masks computed.")
-    args, dapi_mask, red_contours, green_contours, coexpressed_contours = handle_overlay_generation(composite, dapi_mask, td_mask, egfp_mask, args)
+    composite, dapi_mask, td_mask, egfp_mask, red_contours, green_contours, coexpressed_contours = handle_overlay_generation(composite, dapi_mask, td_mask, egfp_mask, args)
     build_output(args, dapi_mask, red_contours, green_contours, coexpressed_contours)
 
 # ---------------- Main Entry Point and Argument Parsing ----------------
